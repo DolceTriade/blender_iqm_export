@@ -12,7 +12,7 @@ bl_info = {
     "tracker_url": "",
     "category": "Import-Export"}
 
-import os, struct, math
+import os, struct, math, pathlib
 import mathutils
 import bpy
 import bpy_extras.io_utils
@@ -48,6 +48,10 @@ IQM_VERTEXARRAY = struct.Struct('<5I')
 IQM_BOUNDS      = struct.Struct('<8f')
 
 MAXVCACHE = 32
+
+class ReportError(Exception):
+    def __init__(self, msg):
+        self.message = msg
 
 class Vertex:
     def __init__(self, index, coord, normal, uv, weights, color):
@@ -719,8 +723,16 @@ def derigifyBones(context, armature, scale):
     print('De-rigified %d bones' % len(worklist))
     return bones
 
+def shouldIgnoreBone(bone, boneignore):
+    if bone.name in boneignore:
+        if len(bone.children) > 0:
+            for c in bone.children.values():
+                if not shouldIgnoreBone(c, boneignore):
+                    raise ReportError('Bone %s has non-ignored children (%s) and cannot be ignored!' % (bone.name, c.name))
+        return True
+    return False
 
-def collectBones(context, armature, scale):
+def collectBones(context, armature, scale, boneignore):
     data = armature.data
     bones = {}
     worldmatrix = armature.matrix_world
@@ -729,6 +741,8 @@ def collectBones(context, armature, scale):
         bonematrix = worldmatrix @ bone.matrix_local
         if scale != 1.0:
             bonematrix.translation *= scale
+        if shouldIgnoreBone(bone, boneignore):
+            continue
         bones[bone.name] = Bone(bone.name, bone.name, index, bone.parent and bones.get(bone.parent.name), bonematrix)
         for child in bone.children:
             if child not in worklist:
@@ -1024,7 +1038,7 @@ def exportIQE(file, meshes, bones, anims):
     file.write('\n')
 
 
-def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True, usebbox = True, usecol = False, scale = 1.0, animspecs = None, matfun = (lambda prefix, image: image), derigify = False, boneorder = None, namedmaterialmeshes = False):
+def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True, usebbox = True, usecol = False, scale = 1.0, animspecs = None, matfun = (lambda prefix, image: image), derigify = False, boneorder = None, boneignore = set(), namedmaterialmeshes = False):
     armature = findArmature(context)
     if useskel and not armature:
         print('No armature selected')
@@ -1042,25 +1056,28 @@ def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True
         if derigify:
             bones = derigifyBones(context, armature, scale)
         else:
-            bones = collectBones(context, armature, scale)
+            bones = collectBones(context, armature, scale, boneignore)
     else:
         bones = {}
 
     if boneorder:
         try:
-            f = open(bpy_extras.io_utils.path_reference(boneorder, os.path.dirname(bpy.data.filepath), os.path.dirname(filename)), "r", encoding = "utf-8")
+            bonepath = pathlib.Path(boneorder)
+            if not bonepath.is_absolute():
+                bonepath = pathlib.Path(bpy_extras.io_utils.path_reference(boneorder, os.path.dirname(bpy.data.filepath), os.path.dirname(filename)))
+
+            f = open(bonepath, "r", encoding = "utf-8")
             names = [line.strip() for line in f.readlines()]
             f.close()
             names = [name for name in names if name in [bone.name for bone in bones.values()]]
             if len(names) != len(bones):
-                print('Bone order (%d) does not match skeleton (%d)' % (len(names), len(bones)))
-                return
+                raise ReportError('Bone order (%d) does not match skeleton (%d)' % (len(names), len(bones)))
+
             print('Reordering bones')
             for bone in bones.values():
                 bone.index = names.index(bone.name)
-        except:
-            print('Failed opening bone order: %s' % boneorder)
-            return
+        except Exception as e:
+            raise ReportError('Failed opening bone order "%s": %s' % (bonepath, e))
 
     if armature:
         oldpose = armature.data.pose_position
@@ -1095,8 +1112,8 @@ def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True
             else:
                 file = open(filename, 'w')
         except:
-            print ('Failed writing to %s' % (filename))
-            return
+            raise ReportError('Failed writing to %s' % (filename))
+
         if filetype == 'IQM':
             iqm.export(file, usebbox)
         elif filetype == 'IQE':
@@ -1104,7 +1121,7 @@ def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True
         file.close()
         print('Saved %s file to %s' % (filetype, filename))
     else:
-        print('No %s file was generated' % (filetype))
+        raise ReportError('No %s file was generated' % (filetype))
 
 
 class ExportIQM(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
@@ -1124,6 +1141,7 @@ class ExportIQM(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
     derigify: bpy.props.BoolProperty(name="De-rigify", description="Export only deformation bones from rigify", default=False)
     namedmaterialmeshes: bpy.props.BoolProperty(name="Named material meshes", description="Append material names to individual exported mesh objects, for meshes with multiple materials", default=False)
     boneorder: bpy.props.StringProperty(name="Bone order", description="Override ordering of bones", subtype="FILE_NAME", default="")
+    boneignore: bpy.props.StringProperty(name="Ignored Bones", description="Bones to ignore", maxlen=1024, default="")
 
     def execute(self, context):
         if self.properties.matfmt == "m+i-e":
@@ -1132,7 +1150,10 @@ class ExportIQM(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
             matfun = lambda prefix, image: prefix
         else:
             matfun = lambda prefix, image: image
-        exportIQM(context, self.properties.filepath, self.properties.usemesh, self.properties.usemods, self.properties.useskel, self.properties.usebbox, self.properties.usecol, self.properties.usescale, self.properties.animspec, matfun, self.properties.derigify, self.properties.boneorder, self.properties.namedmaterialmeshes)
+        try:
+            exportIQM(context, self.properties.filepath, self.properties.usemesh, self.properties.usemods, self.properties.useskel, self.properties.usebbox, self.properties.usecol, self.properties.usescale, self.properties.animspec, matfun, self.properties.derigify, self.properties.boneorder, set(self.properties.boneignore.split(',')), self.properties.namedmaterialmeshes)
+        except ReportError as e:
+            self.report({'ERROR'}, e.message)
         return {'FINISHED'}
 
     def check(self, context):
